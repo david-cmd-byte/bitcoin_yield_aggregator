@@ -70,3 +70,34 @@
         (get-total-supply () (response uint uint))
     )
 )
+
+;; Authorization Functions
+(define-private (is-contract-owner)
+    (is-eq tx-sender contract-owner)
+)
+
+;; Validation Functions
+(define-private (is-valid-protocol-id (protocol-id uint))
+    (and 
+        (> protocol-id u0)
+        (<= protocol-id MAX-PROTOCOL-ID)
+    )
+)
+
+(define-private (is-valid-apy (apy uint))
+    (and 
+        (>= apy MIN-APY)
+        (<= apy MAX-APY)
+    )
+)
+
+(define-private (is-valid-name (name (string-ascii 64)))
+    (and 
+        (not (is-eq name ""))
+        (<= (len name) u64)
+    )
+)
+
+(define-private (protocol-exists (protocol-id uint))
+    (is-some (map-get? protocols { protocol-id: protocol-id }))
+)
