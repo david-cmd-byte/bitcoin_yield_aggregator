@@ -4,8 +4,8 @@ authors = []
 description = ""
 telemetry = true
 requirements = []
-[contracts.btc-yielld-aggregator]
-path = "contracts/btc-yielld-aggregator.clar"
+[contracts.btc-yield-aggregator]
+path = "contracts/btc-yield-aggregator.clar"
 depends_on = []
 
 [repl]
