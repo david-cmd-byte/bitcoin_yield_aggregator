@@ -21,3 +21,12 @@
 (define-constant ERR-INVALID-NAME (err u1010))
 (define-constant ERR-INVALID-TOKEN (err u1011))
 (define-constant ERR-TOKEN-NOT-WHITELISTED (err u1012))
+
+;; Protocol Status Constants
+(define-constant PROTOCOL-ACTIVE true)
+(define-constant PROTOCOL-INACTIVE false)
+
+;; Protocol Configuration Constants
+(define-constant MAX-PROTOCOL-ID u100)
+(define-constant MAX-APY u10000) ;; 100% APY in basis points
+(define-constant MIN-APY u0)
