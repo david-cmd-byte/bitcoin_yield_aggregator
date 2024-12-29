@@ -229,3 +229,14 @@
         (contract-call? token-trait transfer amount sender recipient none)
     )
 )
+
+;; Reward Management Functions
+(define-private (calculate-rewards (user principal) (blocks uint))
+    (let
+        (
+            (user-deposit (unwrap-panic (get-user-deposit user)))
+            (weighted-apy (get-weighted-apy))
+        )
+        (/ (* (get amount user-deposit) weighted-apy blocks) (* u10000 u144 u365))
+    )
+)
