@@ -221,3 +221,11 @@
         (ok true)
     )
 )
+
+;; Token Transfer Helper
+(define-private (safe-token-transfer (token-trait <sip-010-trait>) (amount uint) (sender principal) (recipient principal))
+    (begin
+        (try! (validate-token token-trait))
+        (contract-call? token-trait transfer amount sender recipient none)
+    )
+)
