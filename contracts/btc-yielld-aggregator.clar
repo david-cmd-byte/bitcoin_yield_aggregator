@@ -1,13 +1,23 @@
-;; Title: Bitcoin Yield Aggregator
-;; Summary: A comprehensive DeFi yield strategy management system
-;; Description: This contract enables users to deposit tokens into various yield-generating protocols,
-;; manages protocol allocations, and distributes rewards. It includes features for protocol whitelisting,
-;; emergency shutdown, and dynamic APY management with robust security measures.
+;; Bitcoin Yield Aggregator
+;; 
+;; A secure and efficient DeFi yield strategy management system that enables users to:
+;; - Deposit tokens into various yield-generating protocols
+;; - Manage protocol allocations dynamically
+;; - Earn and claim rewards based on protocol performance
+;; - Benefit from automated strategy rebalancing
+;;
+;; Security Features:
+;; - Protocol whitelisting
+;; - Emergency shutdown mechanism
+;; - Rate limiting
+;; - Comprehensive input validation
+;; - Balance verification
+;; - SIP-010 compliance checks
 
-;; Constants
+;; Principal Constants
 (define-constant contract-owner tx-sender)
 
-;; Error Codes
+;; Error Constants
 (define-constant ERR-NOT-AUTHORIZED (err u1000))
 (define-constant ERR-INVALID-AMOUNT (err u1001))
 (define-constant ERR-INSUFFICIENT-BALANCE (err u1002))
@@ -21,19 +31,25 @@
 (define-constant ERR-INVALID-NAME (err u1010))
 (define-constant ERR-INVALID-TOKEN (err u1011))
 (define-constant ERR-TOKEN-NOT-WHITELISTED (err u1012))
+(define-constant ERR-ZERO-AMOUNT (err u1013))
+(define-constant ERR-INVALID-USER (err u1014))
+(define-constant ERR-ALREADY-WHITELISTED (err u1015))
+(define-constant ERR-AMOUNT-TOO-LARGE (err u1016))
+(define-constant ERR-INVALID-STATE (err u1017))
+(define-constant ERR-RATE-LIMITED (err u1018))
 
-;; Protocol Status Constants
+;; Protocol Constants
 (define-constant PROTOCOL-ACTIVE true)
 (define-constant PROTOCOL-INACTIVE false)
-
-;; Protocol Configuration Constants
 (define-constant MAX-PROTOCOL-ID u100)
-(define-constant MAX-APY u10000) ;; 100% APY in basis points
+(define-constant MAX-APY u10000)
 (define-constant MIN-APY u0)
+(define-constant MAX-TOKEN-TRANSFER u1000000000000)
+(define-constant MIN-REQUIRED-RESPONSES u3)
 
-;; Data Variables
+;; State Variables
 (define-data-var total-tvl uint u0)
-(define-data-var platform-fee-rate uint u100) ;; 1% (base 10000)
+(define-data-var platform-fee-rate uint u100)
 (define-data-var min-deposit uint u100000)
 (define-data-var max-deposit uint u1000000000)
 (define-data-var emergency-shutdown bool false)
@@ -58,6 +74,10 @@
 (define-map whitelisted-tokens 
     { token: principal } 
     { approved: bool })
+
+(define-map user-operations 
+    { user: principal }
+    { last-operation: uint, count: uint })
 
 ;; SIP-010 Token Interface
 (define-trait sip-010-trait
@@ -100,6 +120,28 @@
 
 (define-private (protocol-exists (protocol-id uint))
     (is-some (map-get? protocols { protocol-id: protocol-id }))
+)
+
+(define-private (check-valid-amount (amount uint))
+    (begin
+        (asserts! (> amount u0) ERR-ZERO-AMOUNT)
+        (asserts! (<= amount MAX-TOKEN-TRANSFER) ERR-AMOUNT-TOO-LARGE)
+        (ok amount)
+    )
+)
+
+(define-private (check-valid-user (user principal))
+    (begin
+        (asserts! (not (is-eq user (as-contract tx-sender))) ERR-INVALID-USER)
+        (ok user)
+    )
+)
+
+(define-private (check-contract-state)
+    (begin
+        (asserts! (not (var-get emergency-shutdown)) ERR-STRATEGY-DISABLED)
+        (ok true)
+    )
 )
 
 ;; Protocol Management Functions
@@ -156,14 +198,28 @@
 
 ;; Token Management Functions
 (define-private (validate-token (token-trait <sip-010-trait>))
-    (let 
+    (let
         (
             (token-contract (contract-of token-trait))
             (token-info (map-get? whitelisted-tokens { token: token-contract }))
         )
         (asserts! (is-some token-info) ERR-TOKEN-NOT-WHITELISTED)
         (asserts! (get approved (unwrap-panic token-info)) ERR-PROTOCOL-NOT-WHITELISTED)
-        (ok true)
+        
+        (let
+            (
+                (name-response (try! (contract-call? token-trait get-name)))
+                (symbol-response (try! (contract-call? token-trait get-symbol)))
+                (decimals-response (try! (contract-call? token-trait get-decimals)))
+            )
+            (asserts! (and
+                (> (len name-response) u0)
+                (> (len symbol-response) u0)
+                (>= decimals-response u0)
+            ) ERR-INVALID-TOKEN)
+        )
+        
+        (ok token-contract)
     )
 )
 
@@ -172,14 +228,22 @@
     (let
         (
             (user-principal tx-sender)
-            (current-deposit (default-to { amount: u0, last-deposit-block: u0 } 
+            (current-deposit (default-to { amount: u0, last-deposit-block: u0 }
                 (map-get? user-deposits { user: user-principal })))
         )
-        (try! (validate-token token-trait))
-        (asserts! (not (var-get emergency-shutdown)) ERR-STRATEGY-DISABLED)
+        (try! (check-valid-amount amount))
+        (try! (check-valid-user user-principal))
+        (try! (validate-token-extended token-trait))
+        (try! (check-rate-limit user-principal))
+        (try! (check-contract-state))
+        
         (asserts! (>= amount (var-get min-deposit)) ERR-MIN-DEPOSIT-NOT-MET)
         (asserts! (<= (+ amount (get amount current-deposit)) (var-get max-deposit)) ERR-MAX-DEPOSIT-REACHED)
-        
+
+        (let ((user-balance (try! (contract-call? token-trait get-balance user-principal))))
+            (asserts! (>= user-balance amount) ERR-INSUFFICIENT-BALANCE)
+        )
+
         (try! (safe-token-transfer token-trait amount user-principal (as-contract tx-sender)))
         
         (map-set user-deposits 
@@ -190,6 +254,7 @@
             })
         
         (var-set total-tvl (+ (var-get total-tvl) amount))
+        (update-rate-limit user-principal)
         
         (try! (rebalance-protocols))
         (ok true)
@@ -203,9 +268,16 @@
             (current-deposit (default-to { amount: u0, last-deposit-block: u0 }
                 (map-get? user-deposits { user: user-principal })))
         )
-        (try! (validate-token token-trait))
+        (try! (check-valid-amount amount))
+        (try! (check-valid-user user-principal))
+        (try! (validate-token-extended token-trait))
+        (try! (check-rate-limit user-principal))
         (asserts! (<= amount (get amount current-deposit)) ERR-INSUFFICIENT-BALANCE)
-        
+
+        (let ((contract-balance (try! (contract-call? token-trait get-balance (as-contract tx-sender)))))
+            (asserts! (>= contract-balance amount) ERR-INSUFFICIENT-BALANCE)
+        )
+
         (map-set user-deposits
             { user: user-principal }
             {
@@ -214,6 +286,7 @@
             })
         
         (var-set total-tvl (- (var-get total-tvl) amount))
+        (update-rate-limit user-principal)
         
         (as-contract
             (try! (safe-token-transfer token-trait amount tx-sender user-principal)))
@@ -225,7 +298,14 @@
 ;; Token Transfer Helper
 (define-private (safe-token-transfer (token-trait <sip-010-trait>) (amount uint) (sender principal) (recipient principal))
     (begin
+        (asserts! (not (var-get emergency-shutdown)) ERR-STRATEGY-DISABLED)
+        (try! (check-valid-amount amount))
+        (try! (check-valid-user recipient))
         (try! (validate-token token-trait))
+        
+        (let ((sender-balance (unwrap-panic (contract-call? token-trait get-balance sender))))
+            (asserts! (>= sender-balance amount) ERR-INSUFFICIENT-BALANCE)
+        )
         (contract-call? token-trait transfer amount sender recipient none)
     )
 )
@@ -248,9 +328,14 @@
             (rewards (calculate-rewards user-principal (- block-height 
                 (get last-deposit-block (unwrap-panic (get-user-deposit user-principal))))))
         )
-        (try! (validate-token token-trait))
+        (try! (validate-token-extended token-trait))
+        (try! (check-rate-limit user-principal))
         (asserts! (> rewards u0) ERR-INVALID-AMOUNT)
         
+        (let ((contract-balance (try! (contract-call? token-trait get-balance (as-contract tx-sender)))))
+            (asserts! (>= contract-balance rewards) ERR-INSUFFICIENT-BALANCE)
+        )
+
         (map-set user-rewards
             { user: user-principal }
             {
@@ -260,12 +345,10 @@
                         (map-get? user-rewards { user: user-principal }))))
             })
         
+        (update-rate-limit user-principal)
+        
         (as-contract
-            (try! (contract-call? token-trait transfer
-                rewards
-                tx-sender
-                user-principal
-                none)))
+            (try! (safe-token-transfer token-trait rewards tx-sender user-principal)))
         
         (ok rewards)
     )
@@ -330,16 +413,31 @@
 (define-public (set-emergency-shutdown (shutdown bool))
     (begin
         (asserts! (is-contract-owner) ERR-NOT-AUTHORIZED)
+        (asserts! (not (is-eq shutdown (var-get emergency-shutdown))) ERR-INVALID-STATE)
+        (print { event: "emergency-shutdown", status: shutdown })
         (var-set emergency-shutdown shutdown)
         (ok true)
     )
 )
 
-(define-public (whitelist-token (token principal))
+(define-public (whitelist-token (token <sip-010-trait>))
     (begin
         (asserts! (is-contract-owner) ERR-NOT-AUTHORIZED)
-        (map-set whitelisted-tokens { token: token } { approved: true })
-        (ok true)
+        (let 
+            (
+                (token-contract (contract-of token))
+            )
+            (asserts! (not (is-whitelisted token)) ERR-ALREADY-WHITELISTED)
+            
+            (try! (contract-call? token get-name))
+            (try! (contract-call? token get-symbol))
+            (try! (contract-call? token get-decimals))
+            (try! (contract-call? token get-total-supply))
+            
+            (map-set whitelisted-tokens { token: token-contract } { approved: true })
+            (print { event: "token-whitelisted", token: token-contract })
+            (ok true)
+        )
     )
 )
 
@@ -351,4 +449,52 @@
 (define-private (get-protocol-allocation (protocol-id uint))
     (get allocation (default-to { allocation: u0 }
         (map-get? strategy-allocations { protocol-id: protocol-id })))
+)
+
+(define-private (check-rate-limit (user principal))
+    (let ((user-ops (default-to { last-operation: u0, count: u0 }
+            (map-get? user-operations { user: user }))))
+        (asserts! (or
+            (> block-height (+ (get last-operation user-ops) u144))
+            (< (get count user-ops) u10)
+        ) ERR-RATE-LIMITED)
+        (ok true)
+    )
+)
+
+(define-private (update-rate-limit (user principal))
+    (let ((user-ops (default-to { last-operation: u0, count: u0 }
+            (map-get? user-operations { user: user }))))
+        (map-set user-operations
+            { user: user }
+            {
+                last-operation: block-height,
+                count: (if (> block-height (+ (get last-operation user-ops) u144))
+                    u1
+                    (+ (get count user-ops) u1))
+            }
+        )
+    )
+)
+
+(define-private (validate-token-extended (token-trait <sip-010-trait>))
+    (let
+        (
+            (token-contract (contract-of token-trait))
+            (token-info (map-get? whitelisted-tokens { token: token-contract }))
+        )
+        (try! (validate-token token-trait))
+        
+        (asserts! (not (is-eq token-contract (as-contract tx-sender))) ERR-INVALID-TOKEN)
+        
+        (let ((total-supply (try! (contract-call? token-trait get-total-supply))))
+            (asserts! (> total-supply u0) ERR-INVALID-TOKEN)
+        )
+        
+        (let ((decimals (try! (contract-call? token-trait get-decimals))))
+            (asserts! (and (>= decimals u6) (<= decimals u18)) ERR-INVALID-TOKEN)
+        )
+        
+        (ok token-contract)
+    )
 )
